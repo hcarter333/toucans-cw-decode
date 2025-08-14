@@ -95,14 +95,17 @@ def spans_from_ids(ids, min_len=1):
         prev = i
     return spans
 
-def draw_boxes_png(logmel, spans, out_png, ids_conf=None, title_txt=""):
+def draw_boxes_png(logmel, spans, out_png, ids_conf=None, title_txt="", label_pos="above"):
     """
     logmel: np.ndarray [T, M] (time x mel)
     spans: list of (s,e,char_id)
-    ids_conf: optional per-frame confidences to annotate average per span
+    ids_conf: optional per-frame confidences to annotate avg per span
+    label_pos: "above" | "below" | "inside"
     """
+    import matplotlib.pyplot as plt
+    from matplotlib.patches import Rectangle
+
     T, M = logmel.shape
-    # Use seconds on X axis
     extent = (0, T*HOP_SEC, 0, M)
 
     fig, ax = plt.subplots(figsize=(10, 3.2))
@@ -110,25 +113,59 @@ def draw_boxes_png(logmel, spans, out_png, ids_conf=None, title_txt=""):
     ax.set_xlabel("Time (s)")
     ax.set_ylabel("Mel bin")
 
+    # draw span rectangles
     for (s, e, cid) in spans:
         x0 = s * HOP_SEC
         w  = (e - s) * HOP_SEC
         rect = Rectangle((x0, 0), w, M, fill=False, linewidth=1.8)
         ax.add_patch(rect)
+
+    # place labels outside the axes so they aren't obscured
+    for (s, e, cid) in spans:
+        x0 = s * HOP_SEC
+        w  = (e - s) * HOP_SEC
         label = ID2TOK.get(int(cid), "?")
-        if ids_conf is not None:
-            avgp = float(ids_conf[s:e].mean()) if e > s else 0.0
+        text = label
+        if ids_conf is not None and e > s:
+            import numpy as np
+            avgp = float(ids_conf[s:e].mean())
             text = f"{label} ({avgp:.2f})"
-        else:
-            text = label
-        ax.text(x0 + w/2, M*0.95, text, ha="center", va="top", fontsize=9)
+
+        if label_pos == "inside":
+            # old behavior (can be obscured)
+            ax.text(x0 + w/2, M*0.95, text, ha="center", va="top", fontsize=9)
+        elif label_pos == "below":
+            # x in data (seconds), y in axes coords; y < 0 puts it below the plot
+            ax.text(
+                x0 + w/2, -0.08, text,
+                transform=ax.get_xaxis_transform(),
+                ha="center", va="top", fontsize=9, clip_on=False,
+                bbox=dict(facecolor="white", alpha=0.8, edgecolor="none", pad=1.5),
+            )
+        else:  # "above"
+            ax.text(
+                x0 + w/2, 1.02, text,
+                transform=ax.get_xaxis_transform(),
+                ha="center", va="bottom", fontsize=9, clip_on=False,
+                bbox=dict(facecolor="white", alpha=0.8, edgecolor="none", pad=1.5),
+            )
 
     if title_txt:
         ax.set_title(title_txt)
-    fig.tight_layout()
+
+    # leave space so outside labels aren't cut off
+    if label_pos == "above":
+        fig.tight_layout(rect=[0, 0, 1, 0.92])
+    elif label_pos == "below":
+        fig.tight_layout(rect=[0, 0.08, 1, 1])
+    else:
+        fig.tight_layout()
+
     os.makedirs(os.path.dirname(out_png), exist_ok=True)
-    fig.savefig(out_png, dpi=150)
+    fig.savefig(out_png, dpi=150, bbox_inches="tight")
     plt.close(fig)
+
+
 
 def main():
     ap = argparse.ArgumentParser(description="Visualize greedy CTC spans on the log-mel spectrogram.")
