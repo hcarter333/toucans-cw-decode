@@ -1,150 +1,177 @@
-import os, sys, argparse, importlib, numpy as np
+# save as viz_greedy_spans.py
+import argparse, os
+import numpy as np
+import tensorflow as tf
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
-from matplotlib import patches
-import tensorflow as tf
+from matplotlib.patches import Rectangle
 
-def load_train_mod(name):
-    try:
-        return importlib.import_module(name)
-    except ModuleNotFoundError:
-        # if this viz script lives in a subdir, try repo root
-        repo_root = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
-        sys.path.insert(0, repo_root)
-        return importlib.import_module(name)
+# --- same alphabet & constants as your infer_morse.py ---
+MORSE_TABLE = {'A':'.-','B':'-...','C':'-.-.','D':'-..','E':'.','F':'..-.','G':'--.',
+'H':'....','I':'..','J':'.---','K':'-.-','L':'.-..','M':'--','N':'-.','O':'---',
+'P':'.--.','Q':'--.-','R':'.-.','S':'...','T':'-','U':'..-','V':'...-','W':'.--',
+'X':'-..-','Y':'-.--','Z':'--..','0':'-----','1':'.----','2':'..---','3':'...--',
+'4':'....-','5':'.....','6':'-....','7':'--...','8':'---..','9':'----.','.':' .-.-.-',
+',':'--..--','?':'..--..','/':'-..-.','-':'-....-','(':'-.--. ',')':'-.--.-','@':'.--.-.',
+':':'---...',"\'":'.----.','!':'-.-.--','&':'.-...',';':'-.-.-.','=':'-...-','+':'.-.-.'}
+ALPHABET = sorted(set(list(MORSE_TABLE.keys()) + [' ']))
+BLANK = 0
+ID2TOK = {i+1: ch for i, ch in enumerate(ALPHABET)}  # 1..N
 
-def rle_segments(ids, blank_id=0, min_len=3):
-    """
-    Run-length segments of non-blank classes.
-    Returns list of (start_idx, end_idx_inclusive, class_id).
-    """
-    segs = []
-    if len(ids) == 0: 
-        return segs
-    prev = ids[0]
-    start = 0
-    for i in range(1, len(ids)):
-        if ids[i] != prev:
-            if prev != blank_id:
-                if i - 1 - start + 1 >= min_len:
-                    segs.append((start, i - 1, int(prev)))
-            start = i
-            prev = ids[i]
-    # tail
-    if prev != blank_id and (len(ids) - 1 - start + 1) >= min_len:
-        segs.append((start, len(ids) - 1, int(prev)))
-    return segs
+SR, N_FFT, HOP, N_MELS = 16000, 1024, 256, 64
+HOP_SEC = HOP / SR
 
-def dominant_band(logmel, t0, t1, pad=2):
-    """
-    Find dominant mel bin in frames [t0,t1] and return (y0,height) for a tight band box.
-    """
-    # logmel: [T, M]
-    M = logmel.shape[1]
-    slab = logmel[t0:t1+1, :]          # [W, M]
-    prof = slab.mean(axis=0)           # [M]
-    k = int(np.argmax(prof))
-    y0 = max(0, k - pad)
-    y1 = min(M - 1, k + pad)
-    return y0, (y1 - y0 + 1)
+# Build mel filterbank once so it matches training/infer script
+MEL_FB = tf.constant(tf.signal.linear_to_mel_weight_matrix(
+    num_mel_bins=N_MELS, num_spectrogram_bins=N_FFT//2+1,
+    sample_rate=SR, lower_edge_hertz=20.0, upper_edge_hertz=SR/2.0
+))
 
-def main():
-    ap = argparse.ArgumentParser(
-        description="Draw CTC-derived 'bounding boxes' for decoded Morse on a log-mel spectrogram."
-    )
-    ap.add_argument("wav", help="Input 16 kHz mono WAV")
-    ap.add_argument("--model", default="artifacts/morse_ctc_model.keras", help="Keras model path")
-    ap.add_argument("--train-mod", default="morse_ctc_tpu",
-                    help="Python module name of your training script (to reuse wav_to_logmels, constants, ID2TOK)")
-    ap.add_argument("--out", default=None, help="Output PNG path (default: <wav>.boxes.png)")
-    ap.add_argument("--min-seg-frames", type=int, default=3, help="Ignore tiny segments shorter than this")
-    ap.add_argument("--full-height", action="store_true",
-                    help="Draw boxes full-height instead of a tight tone band")
-    args = ap.parse_args()
+def wav_to_logmels(wav):
+    stft = tf.signal.stft(wav, frame_length=N_FFT, frame_step=HOP, fft_length=N_FFT)
+    mag = tf.abs(stft)
+    mel = tf.matmul(tf.square(mag), MEL_FB)
+    return tf.math.log(mel + 1e-6)  # [T, M]
 
-    # --- load your training module for consistent preprocessing ---
-    T = load_train_mod(args.train_mod)
+def preprocess(wav_f32):
+    feats = wav_to_logmels(tf.convert_to_tensor(wav_f32, tf.float32))
+    m, s = tf.reduce_mean(feats), tf.math.reduce_std(feats) + 1e-6
+    return ((feats - m) / s)[None, ...]  # [1,T,M]
 
-    wav_to_logmels = getattr(T, "wav_to_logmels")
-    SR    = getattr(T, "SR", 16000)
-    HOP   = getattr(T, "HOP", 256)
-    N_MELS= getattr(T, "N_MELS", 64)
-    ID2TOK= getattr(T, "ID2TOK", None)
-    BLANK = getattr(T, "BLANK_TOKEN", 0)
-
-    # --- load audio ---
-    audio_bytes = tf.io.read_file(args.wav)
-    audio, sr = tf.audio.decode_wav(audio_bytes)  # [N,1]
-    audio = tf.squeeze(audio, -1)                 # [N]
+def load_wav(path):
+    audio_bytes = tf.io.read_file(path)
+    audio, sr = tf.audio.decode_wav(audio_bytes)
+    audio = tf.squeeze(audio, -1)  # mono
     if int(sr.numpy()) != SR:
-        raise SystemExit(f"Expected {SR} Hz, got {int(sr.numpy())} Hz. Please resample.")
+        raise SystemExit("Please resample to 16 kHz: ffmpeg -i in.wav -ac 1 -ar 16000 out.wav")
+    return audio.numpy()
 
-    # --- compute log-mel (un-normalized) for plotting ---
-    logmel = wav_to_logmels(audio).numpy()        # [T, M]
-    Tframes, Mbins = logmel.shape
+def greedy_decode_frames(logits):
+    """
+    logits: tf.Tensor [1, T, C]
+    Returns:
+      ids: np.ndarray [T] argmax class per frame
+      probs: np.ndarray [T] max softmax prob per frame
+    """
+    logits_np = logits.numpy()
+    # softmax for confidence (argmax would be same on logits)
+    probs = tf.nn.softmax(logits, axis=-1).numpy()[0]  # [T, C]
+    ids   = probs.argmax(axis=-1)                      # [T]
+    conf  = probs[np.arange(probs.shape[0]), ids]      # [T]
+    return ids, conf
 
-    # --- model features (z-norm like training) ---
-    feats = tf.convert_to_tensor(logmel, tf.float32)
-    m = tf.reduce_mean(feats); s = tf.math.reduce_std(feats) + 1e-6
-    feats = (feats - m) / s
-    feats = feats[None, ...]                      # [1, T, M]
+def collapse_to_text(ids):
+    out, prev = [], -1
+    for i in ids:
+        i = int(i)
+        if i != prev and i != BLANK:
+            out.append(ID2TOK.get(i, ''))
+        prev = i
+    return ''.join(out)
 
-    # --- load model and run ---
-    model = tf.keras.models.load_model(args.model, compile=False)
-    logits = model(feats, training=False).numpy()[0]  # [T, C]
-    # framewise class & prob
-    probs = tf.nn.softmax(logits, axis=-1).numpy()
-    cls   = probs.argmax(axis=-1)                  # [T]
+def spans_from_ids(ids, min_len=1):
+    """
+    Build contiguous (start_frame, end_frame, char_id) for non-blank runs.
+    min_len: minimum frames to keep a span.
+    """
+    spans = []
+    T = len(ids)
+    prev = BLANK
+    start = None
+    for t in range(T):
+        i = int(ids[t])
+        if i != BLANK and (prev == BLANK or i != prev):
+            # start new span
+            start = t
+        if i == BLANK and prev != BLANK and start is not None:
+            if (t - start) >= min_len:
+                spans.append((start, t, int(prev)))
+            start = None
+        # handle last frame
+        if t == T-1 and i != BLANK and start is not None:
+            if (t+1 - start) >= min_len:
+                spans.append((start, t+1, int(i)))
+        prev = i
+    return spans
 
-    # --- merge into time segments for non-blank IDs ---
-    segs = rle_segments(cls, blank_id=BLANK, min_len=args.min_seg_frames)
+def draw_boxes_png(logmel, spans, out_png, ids_conf=None, title_txt=""):
+    """
+    logmel: np.ndarray [T, M] (time x mel)
+    spans: list of (s,e,char_id)
+    ids_conf: optional per-frame confidences to annotate average per span
+    """
+    T, M = logmel.shape
+    # Use seconds on X axis
+    extent = (0, T*HOP_SEC, 0, M)
 
-    # --- plot spectrogram ---
-    fig, ax = plt.subplots(figsize=(12, 4))
-    ax.imshow(logmel.T, origin="lower", aspect="auto", cmap="magma")
-    ax.set_xlabel("Frames")
+    fig, ax = plt.subplots(figsize=(10, 3.2))
+    ax.imshow(logmel.T, origin="lower", aspect="auto", extent=extent, cmap="magma")
+    ax.set_xlabel("Time (s)")
     ax.set_ylabel("Mel bin")
 
-    # Optional right Y axis in Hz like your previous viz
-    def mel_y_ticks_to_hz(ax_right):
-        # crude reference labels; same as earlier helper you used
-        ticks = [0, 5, 10, 15, 20, 25, 30, 40, 50, 60]   # mel bins
-        # map bins to linear freq approx: project mel bin centers back to Hz using SR/4 upper edge
-        # Here we’ll just annotate helpful values (visual guide)
-        ax_right.set_yticks(ticks)
-        labels = [""]*len(ticks)
-        for i, b in enumerate(ticks):
-            labels[i] = ""  # keep empty unless you want to compute exact inversion
-        ax_right.set_yticklabels(labels)
-        ax_right.set_ylabel("Frequency (Hz)")
-        ax_right.grid(False)
-
-    # --- draw boxes ---
-    for (t0, t1, cid) in segs:
-        char = ID2TOK.get(int(cid), str(int(cid))) if ID2TOK else str(int(cid))
-        conf = probs[t0:t1+1, cid].mean()
-
-        if args.full_height:
-            y0, h = 0, Mbins
-        else:
-            y0, h = dominant_band(logmel, t0, t1, pad=2)
-
-        rect = patches.Rectangle(
-            (t0, y0), (t1 - t0 + 1), h,
-            linewidth=1.5, edgecolor="cyan", facecolor="none", alpha=0.9
-        )
+    for (s, e, cid) in spans:
+        x0 = s * HOP_SEC
+        w  = (e - s) * HOP_SEC
+        rect = Rectangle((x0, 0), w, M, fill=False, linewidth=1.8)
         ax.add_patch(rect)
-        ax.text(t0 + 1, y0 + h + 1, f"{char} ({conf:.2f})",
-                color="cyan", fontsize=9, va="bottom", ha="left")
+        label = ID2TOK.get(int(cid), "?")
+        if ids_conf is not None:
+            avgp = float(ids_conf[s:e].mean()) if e > s else 0.0
+            text = f"{label} ({avgp:.2f})"
+        else:
+            text = label
+        ax.text(x0 + w/2, M*0.95, text, ha="center", va="top", fontsize=9)
 
-    plt.tight_layout()
-    out_png = args.out or (os.path.splitext(args.wav)[0] + ".boxes.png")
-    plt.savefig(out_png, dpi=150)
-    plt.close()
-    print(f"Wrote {out_png}")
-    print(f"Segments: {[(t0, t1, (ID2TOK.get(c, str(c)) if ID2TOK else str(c))) for t0,t1,c in segs]}")
-    print("NOTE: These are CTC-aligned character spans, not object-detection boxes.")
-    
+    if title_txt:
+        ax.set_title(title_txt)
+    fig.tight_layout()
+    os.makedirs(os.path.dirname(out_png), exist_ok=True)
+    fig.savefig(out_png, dpi=150)
+    plt.close(fig)
+
+def main():
+    ap = argparse.ArgumentParser(description="Visualize greedy CTC spans on the log-mel spectrogram.")
+    ap.add_argument("--model", default="artifacts/morse_ctc_model.keras")
+    ap.add_argument("--out", default=None, help="Output PNG path (default: WAV.png next to input)")
+    ap.add_argument("--min-seg-frames", type=int, default=1, help="Minimum frames per character span")
+    ap.add_argument("wav")
+    args = ap.parse_args()
+
+    # Load model and audio
+    model = tf.keras.models.load_model(args.model, compile=False)
+    wav = load_wav(args.wav)
+
+    # Features for model
+    feats = preprocess(wav)              # [1, T, M]
+    logits = model(feats, training=False)  # [1, T, C]
+
+    # Greedy per-frame ids (no prob threshold)
+    ids, conf = greedy_decode_frames(logits)
+    text = collapse_to_text(ids)
+    print("Decoded text:\n", text)
+
+    # Spans from ids
+    spans = spans_from_ids(ids, min_len=args.min_seg_frames)
+    print(f"Found {len(spans)} spans.")
+    for (s,e,cid) in spans:
+        t0, t1 = s*HOP_SEC, e*HOP_SEC
+        print(f"[{t0:7.3f}s – {t1:7.3f}s] {ID2TOK.get(cid,'?')}  frames={e-s}")
+
+    # Log-mel for plotting (un-normalized like infer script)
+    feats_plot = wav_to_logmels(tf.convert_to_tensor(wav, tf.float32)).numpy()  # [T, M]
+
+    # Output path
+    if args.out:
+        out_png = args.out
+    else:
+        base = os.path.splitext(os.path.basename(args.wav))[0]
+        out_dir = os.path.join("artifacts", "viz_boxes")
+        out_png = os.path.join(out_dir, base + ".boxes.png")
+
+    title = f"{os.path.basename(args.wav)} | {text}"
+    draw_boxes_png(feats_plot, spans, out_png, ids_conf=conf, title_txt=title)
+    print("Wrote", out_png)
+
 if __name__ == "__main__":
     main()
