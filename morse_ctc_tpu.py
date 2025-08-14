@@ -3,6 +3,7 @@ import numpy as np
 import tensorflow as tf
 
 model = None
+optimizer = None
 
 PHRASES = [
     "CQ CQ", "CQ CQ CQ", "DE", "QRP", "QRO", "POTA", "SOTA", "5NN", "K", "BK", "KN", "SK"
@@ -236,9 +237,12 @@ def encode_text_to_ids(s):
 def sample_example():
     # Draw augmentation params
     wpm   = random.uniform(12, 28)
-    fwob  = random.uniform(0.0, 0.02)
+    fwob  = random.uniform(0.008, 0.02)
     jitter= random.uniform(0.05, 0.15)
-    snr   = random.uniform(0.0, 24.0)
+    if np.random.rand() < 0.5:
+        snr = np.random.uniform(6.0, 12.0)
+    else:
+        snr = np.random.uniform(0.0, 6.0) if np.random.rand() < 0.3 else np.random.uniform(12.0, 20.0)
     basef = random.uniform(F_MIN, F_MAX)
 
     text  = random_text()
@@ -383,11 +387,7 @@ def greedy_ctc_decode(logits, logit_lens):
     return out
 
 
-import math, random, string, os, io
-import numpy as np
-import tensorflow as tf
 
-model = None
 
 # =========================
 # 0) TPU / Strategy setup
@@ -440,17 +440,41 @@ def wpm_to_unit_seconds(wpm):
     # dit duration (sec) = 1.2 / wpm (common approximation)
     return 1.2 / wpm
 
-def render_tone(freq, duration_s, amp=0.8, phase=0.0):
-    t = np.linspace(0, duration_s, int(SR*duration_s), endpoint=False)
-    # Simple sine with cosine-squared fade in/out to avoid clicks
-    env = np.ones_like(t)
-    ramp = max(1, int(0.005*SR))  # 5ms ramp
-    if len(env) >= 2*ramp:
-        r = np.linspace(0, math.pi/2, ramp)
-        env[:ramp] = np.sin(r)**2
-        env[-ramp:] = np.sin(r[::-1])**2
-    sig = amp * env * np.sin(2*np.pi*freq*t + phase)
+import numpy as np, math
+
+def render_tone(freq, duration_s, amp=0.8, phase=0.0,
+                ramp_ms=2.0, fm_dev_hz=0.0, fm_rate_hz=0.0):
+    """Sine with short ramps + optional slow FM warble."""
+    N = int(SR * duration_s)
+    t = np.arange(N, dtype=np.float32) / SR
+
+    # envelope (shorter ramp to allow a bit more 'click')
+    env = np.ones(N, np.float32)
+    r = max(1, int(ramp_ms * 1e-3 * SR))
+    if N >= 2*r:
+        rwin = np.linspace(0, math.pi/2, r, dtype=np.float32)
+        env[:r]  = np.sin(rwin)**2
+        env[-r:] = np.sin(rwin[::-1])**2
+
+    if fm_dev_hz > 0.0 and fm_rate_hz > 0.0:
+        phi0 = np.random.uniform(0, 2*np.pi)
+        inst_freq = freq + fm_dev_hz * np.sin(2*np.pi*fm_rate_hz*t + phi0)
+        phase_acc = 2*np.pi*np.cumsum(inst_freq)/SR + phase
+        sig = amp * env * np.sin(phase_acc)
+    else:
+        sig = amp * env * np.sin(2*np.pi*freq*t + phase)
     return sig.astype(np.float32)
+
+def apply_qsb(sig, depth_db=3.0, rate_hz=0.6):
+    """Slow amplitude fading (QSB)."""
+    if depth_db <= 0 or rate_hz <= 0: return sig
+    N = sig.shape[0]
+    t = np.arange(N, dtype=np.float32)/SR
+    phi = np.random.uniform(0, 2*np.pi)
+    # convert depth in dB to linear swing around 1.0
+    a = 10**(depth_db/20.0) - 1.0     # e.g., 3 dB ≈ +0.412
+    env = 1.0 + 0.5*a*np.sin(2*np.pi*rate_hz*t + phi)
+    return (sig * env).astype(np.float32)
 
 def render_silence(duration_s):
     return np.zeros(int(SR*duration_s), dtype=np.float32)
@@ -492,24 +516,25 @@ def synth_morse_audio_from_text(
 
         # token is like ".-."
         for i, sym in enumerate(token):
-            # element tone duration
-            dur_units = 1 if sym == '.' else 3
-            dur = dur_units * unit * np.random.uniform(1.0 - jitter, 1.0 + jitter)
-
-            # wobble frequency slightly
-            f = freq * (1.0 + np.random.uniform(-fwobble, fwobble))
-            audio.append(render_tone(f, dur))
-
-            # intra-character gap (1 unit) except after last element
+            dur = (1 if sym=='.' else 3) * unit * np.random.uniform(1.0-jitter, 1.0+jitter)
+            f   = base_freq * (1.0 + np.random.uniform(-fwobble, fwobble))
+            # slow FM warble ~0.2–2 Hz, ±8–15 Hz
+            fm_rate = np.random.uniform(0.2, 2.0)
+            fm_dev  = np.random.uniform(8.0, 15.0)
+            audio.append(render_tone(f, dur, ramp_ms=2.0, fm_dev_hz=fm_dev, fm_rate_hz=fm_rate))
             if i != len(token)-1:
-                gap = unit * np.random.uniform(1.0 - jitter, 1.0 + jitter)
+                gap = unit * np.random.uniform(1.0-jitter, 1.0+jitter)
                 audio.append(render_silence(gap))
-
-        # gap between letters = 3 units
-        gap = 3*unit * np.random.uniform(1.0 - jitter, 1.0 + jitter)
+        gap = 3*unit * np.random.uniform(1.0-jitter, 1.0+jitter)
         audio.append(render_silence(gap))
 
-    sig = np.concatenate(audio) if audio else np.zeros(1, dtype=np.float32)
+    sig = np.concatenate(audio) if audio else np.zeros(1, np.float32)
+
+    # QSB fading 0.1–1.0 Hz, 1–6 dB
+    sig = apply_qsb(sig,
+        depth_db=np.random.uniform(1.0, 6.0),
+        rate_hz=np.random.uniform(0.1, 1.0)
+    )
 
     # Add band-limited-ish noise (white + mild HP/LP)
     if snr_db is not None:
@@ -555,7 +580,7 @@ def wav_to_logmels(wav):
     mel_fb = tf.signal.linear_to_mel_weight_matrix(
         num_mel_bins=N_MELS,
         num_spectrogram_bins=N_FFT//2 + 1,
-        sample_rate=SR, lower_edge_hertz=20.0, upper_edge_hertz=SR/2.0
+        sample_rate=SR, lower_edge_hertz=100.0, upper_edge_hertz=SR/4.0
     )
     mel = tf.matmul(tf.square(mag), mel_fb)  # power mel
     eps = tf.constant(1e-6, tf.float32)
@@ -786,6 +811,7 @@ print("Training complete. Try inference by loading a wav and calling decode_wav(
 # 6) Training loop
 # =========================
 def main():
+    global model, optimizer   
     with STRATEGY.scope():
         # --- Option A: resume from saved .keras (fresh optimizer state) ---
         default_resume = "artifacts/morse_ctc_model.keras"
