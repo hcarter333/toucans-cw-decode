@@ -29,6 +29,7 @@ training = _import_training_module()
 synth_morse_audio_from_text = getattr(training, "synth_morse_audio_from_text")
 wav_to_logmels  = getattr(training, "wav_to_logmels")
 random_text     = getattr(training, "random_text", None)
+random_ham_text     = getattr(training, "random_ham_text", None)
 SR              = getattr(training, "SR", 16000)
 F_MIN           = getattr(training, "F_MIN", 400.0)
 F_MAX           = getattr(training, "F_MAX", 900.0)
@@ -67,8 +68,8 @@ def slugify(s, maxlen=48):
     return re.sub(r"[^A-Za-z0-9]+", "_", s.strip()).strip("_")[:maxlen] or "sample"
 
 def pick_text(min_len, max_len):
-    if random_text is not None:
-        return random_text(min_len=min_len, max_len=max_len)
+    if random_ham_text is not None:
+        return random_ham_text(min_len=min_len, max_len=max_len)
     # Fallback alphabet if the training module didn’t expose random_text
     import string as _s
     alphabet = _s.ascii_uppercase + "0123456789 "
@@ -92,7 +93,7 @@ def main():
     ap.add_argument("--cmap", default="magma", help="Matplotlib colormap for spectrogram")
     args = ap.parse_args()
 
-    random.seed(args.seed)
+    #random.seed(args.seed)
     os.makedirs(args.out, exist_ok=True)
 
     manifest_path = os.path.join(args.out, "manifest.csv")
