@@ -95,26 +95,45 @@ def spans_from_ids(ids, min_len=1):
         prev = i
     return spans
 
+# Put these near your other globals (match your training settings)
+MEL_LO_HZ = 100.0
+MEL_HI_HZ = SR / 4.0   # 4 kHz when SR=16 kHz
+HOP_SEC   = HOP / SR
+
 def draw_boxes_png(logmel, spans, out_png, ids_conf=None, title_txt="", label_pos="above"):
+    import numpy as np
     import matplotlib.pyplot as plt
     from matplotlib.patches import Rectangle
-    import os, numpy as np
+    import os
 
     T, M = logmel.shape
-    extent = (0, T*HOP_SEC, 0, M)
+    extent = (0, T * HOP_SEC, 0, M)
 
+    # ---- helpers to map Hz <-> mel bins (for the right-hand axis) ----
+    def hz_to_mel(hz): return 2595.0 * np.log10(1.0 + hz / 700.0)
+    def mel_to_hz(m): return 700.0 * (10.0**(m / 2595.0) - 1.0)
+
+    lo_mel = hz_to_mel(MEL_LO_HZ)
+    hi_mel = hz_to_mel(MEL_HI_HZ)
+
+    def hz_to_bin(hz):
+        hz = np.clip(hz, MEL_LO_HZ, MEL_HI_HZ)
+        m  = hz_to_mel(hz)
+        return (m - lo_mel) / (hi_mel - lo_mel) * (M - 1)
+
+    # ---- plot ----
     fig, ax = plt.subplots(figsize=(10, 3.2))
     ax.imshow(logmel.T, origin="lower", aspect="auto", extent=extent, cmap="magma")
     ax.set_xlabel("Time (s)")
     ax.set_ylabel("Mel bin")
 
-    # Boxes
+    # draw CTC spans as “boxes” along time
     for (s, e, cid) in spans:
         x0 = s * HOP_SEC
         w  = (e - s) * HOP_SEC
         ax.add_patch(Rectangle((x0, 0), w, M, fill=False, linewidth=1.8))
 
-    # Labels (above/below/inside)
+    # label placement
     for (s, e, cid) in spans:
         x0 = s * HOP_SEC
         w  = (e - s) * HOP_SEC
@@ -125,7 +144,7 @@ def draw_boxes_png(logmel, spans, out_png, ids_conf=None, title_txt="", label_po
             text = f"{label} ({avgp:.2f})"
 
         if label_pos == "inside":
-            ax.text(x0 + w/2, M*0.95, text, ha="center", va="top", fontsize=9)
+            ax.text(x0 + w/2, M * 0.95, text, ha="center", va="top", fontsize=9)
         elif label_pos == "below":
             ax.text(x0 + w/2, -0.08, text,
                     transform=ax.get_xaxis_transform(),
@@ -137,13 +156,27 @@ def draw_boxes_png(logmel, spans, out_png, ids_conf=None, title_txt="", label_po
                     ha="center", va="bottom", fontsize=9, clip_on=False,
                     bbox=dict(facecolor="white", alpha=0.8, edgecolor="none", pad=1.5))
 
-    # >>> Move title ABOVE the axes/labels <<<
-    if title_txt:
-        fig.suptitle(title_txt, y=0.99)  # higher than the axis area & labels
+    # ---- RIGHT-HAND FREQUENCY AXIS (Hz) ----
+    ax_r = ax.twinx()
+    ax_r.set_ylim(0, M)
 
-    # Leave space so labels/title aren’t cropped
+    # denser ticks up to 2 kHz, then every 500 Hz up to MEL_HI_HZ
+    ticks_low = np.arange(0, min(2000, MEL_HI_HZ) + 1, 200)
+    ticks_hi  = np.arange(2500, MEL_HI_HZ + 1, 500)
+    ticks_hz  = np.unique(np.concatenate([ticks_low[ticks_low >= MEL_LO_HZ], ticks_hi]))
+
+    tick_pos = [hz_to_bin(h) for h in ticks_hz]
+    ax_r.set_yticks(tick_pos)
+    ax_r.set_yticklabels([f"{int(h)}" for h in ticks_hz])
+    ax_r.set_ylabel("Frequency (Hz)")
+
+    # ---- title above everything ----
+    if title_txt:
+        fig.suptitle(title_txt, y=0.995)
+
+    # leave room for top labels/title
     if label_pos == "above":
-        fig.tight_layout(rect=[0, 0, 1, 0.86])   # more top room
+        fig.tight_layout(rect=[0, 0, 1, 0.86])
     elif label_pos == "below":
         fig.tight_layout(rect=[0, 0.08, 1, 1])
     else:
